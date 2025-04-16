@@ -3,6 +3,8 @@ import os
 import sqlite3
 import logging
 from datetime import datetime
+from io import BytesIO
+from PyPDF2 import PdfReader
 from playwright.async_api import async_playwright
 
 DOWNLOAD_DIR = os.path.join(os.getcwd(), "downloads")
@@ -29,19 +31,13 @@ def init_db():
     conn.commit()
     conn.close()
 
-def save_to_db(report_id, company, title, date, local_file):
-    conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
-    try:
-        cursor.execute('''
-            INSERT INTO filings (report_id, company, report_title, report_date, local_file)
-            VALUES (?, ?, ?, ?, ?)
-        ''', (report_id, company, title, date, local_file))
-        conn.commit()
-    except sqlite3.IntegrityError:
-        logging.info(f"Skipping duplicate report ID {report_id}")
-    finally:
-        conn.close()
+def extract_text_and_find_keyword(pdf_data: BytesIO) -> bool:
+    reader = PdfReader(pdf_data)
+    for page in reader.pages:
+        text = page.extract_text()
+        if text and "תקנה 21" in text:
+            return True
+    return False
 
 async def set_date(page, selector, date_str):
     await page.wait_for_selector(selector)
@@ -54,7 +50,7 @@ async def set_date(page, selector, date_str):
     """, [selector, date_str])
     logging.info(f"Set date {date_str} in {selector}")
 
-async def fetch_reports_playwright(from_year, to_year):
+async def fetch_reports_playwright(from_year, to_year, mode="download"):
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=False)
         context = await browser.new_context(accept_downloads=True)
@@ -72,7 +68,7 @@ async def fetch_reports_playwright(from_year, to_year):
         await page.get_by_role("treeitem", name="דוח תקופתי ושנתי", exact=True).locator('input[type="checkbox"]').click()
         await asyncio.sleep(1)
 
-        await page.locator('input[placeholder="טקסט חופשי"]').fill("דוח תקופתי ושנתי")
+        await page.locator('input[placeholder="טקסט חופשי"]').fill("דוח תקופתי")
         await asyncio.sleep(1)
 
         await page.locator('button.panel-filter-bt', has_text="סינון").first.click()
@@ -103,40 +99,28 @@ async def fetch_reports_playwright(from_year, to_year):
                 report_page = await context.wait_for_event("page")
                 await report_page.wait_for_load_state("load")
 
-                await process_report(report_page, report_id)
+                if mode == "download":
+                    await process_report_download(report_page, report_id)
+                elif mode == "extract":
+                    await process_report_extract(report_page, report_id)
+
                 await report_page.close()
 
             try:
-                next_button = page.locator('button[aria-label="עבור לעמוד הבא"]')
-
-                await page.wait_for_timeout(1000)  # small pause
-
-                if await next_button.count() == 0:
-                    logging.info("Next page button not found. Stopping.")
-                    break
-
-                is_disabled = await next_button.get_attribute("disabled")
-                if is_disabled is not None:
+                next_button = page.locator('div.panel-footer button:has-text("עבור לעמוד הבא")')
+                await next_button.scroll_into_view_if_needed()
+                if await next_button.is_disabled():
                     logging.info("Next page button is disabled. Stopping.")
                     break
-
-                await next_button.click(force=True)
-                await page.wait_for_load_state("networkidle")
-                await asyncio.sleep(1)
-
-            except Exception as e:
-                logging.warning(f"Couldn't click next page: {e}")
-                break
-            except Exception as e:
-                logging.warning(f"Couldn't click next page: {e}")
-                break
+                await next_button.click()
+                await page.wait_for_timeout(3000)
             except Exception as e:
                 logging.warning(f"Couldn't click next page: {e}")
                 break
 
         await browser.close()
 
-async def process_report(page, report_id):
+async def process_report_download(page, report_id):
     try:
         await page.wait_for_selector('a.ma-tooltip[aria-label="הורדת מסמך"]', timeout=15000)
 
@@ -149,18 +133,38 @@ async def process_report(page, report_id):
 
         logging.info(f"Downloaded to {local_file_path}")
 
+    except Exception as e:
+        logging.error(f"Failed to process report: {e}")
+
+async def process_report_extract(page, report_id):
+    try:
+        await page.wait_for_selector('a.ma-tooltip[aria-label="הורדת מסמך"]', timeout=15000)
+
+        async with page.expect_download() as download_info:
+            await page.locator('a.ma-tooltip[aria-label="הורדת מסמך"]').click()
+        download = await download_info.value
+
+        temp_path = await download.path()
+        with open(temp_path, "rb") as f:
+            pdf_data = BytesIO(f.read())
+
+        found = extract_text_and_find_keyword(pdf_data)
+        if found:
+            logging.info(f"✔️ Report {report_id} contains 'תקנה 21'")
+        else:
+            logging.info(f"❌ Report {report_id} does NOT contain 'תקנה 21'")
 
     except Exception as e:
         logging.error(f"Failed to process report: {e}")
 
 async def main():
     init_db()
-
     from_year = 2024
     to_year = 2024
+    mode = "extract"  # Change to "download" for downloading
 
     start_time = datetime.now()
-    await fetch_reports_playwright(from_year, to_year)
+    await fetch_reports_playwright(from_year, to_year, mode=mode)
     end_time = datetime.now()
 
     logging.info(f"All done in {end_time - start_time}")
