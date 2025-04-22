@@ -180,6 +180,7 @@ async def process_report_extract(page, report_id, company):
         structured_rows = []
         start_found = False
         x_threshold = 7
+        non_table_count = 0
 
         for y in sorted(rows_by_y.keys()):
             row_words = sorted(rows_by_y[y], key=lambda t: t[0])
@@ -199,7 +200,12 @@ async def process_report_extract(page, report_id, company):
                     continue
 
             if not is_table:
-                break
+                non_table_count += 1
+                if non_table_count >= 10:
+                    break
+                else:
+                    continue
+            non_table_count = 0
 
             # חלוקה לשם, תפקיד ונתונים
             name_parts = []
