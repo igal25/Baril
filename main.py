@@ -1,43 +1,32 @@
 import asyncio
 import os
-import sqlite3
 import logging
+import tempfile
+import re
+import csv
+from collections import defaultdict
+
 from datetime import datetime
 from io import BytesIO
-from PyPDF2 import PdfReader
+
+import fitz
 from playwright.async_api import async_playwright
 
-DOWNLOAD_DIR = os.path.join(os.getcwd(), "downloads")
-DB_FILE = "maya_filings.db"
+from pdfminer.high_level import extract_text
+from pdfminer.layout import LAParams
 
+# Suppress PyMuPDF and pdfminer warnings
+import logging
+logging.getLogger("fitz").setLevel(logging.ERROR)
+logging.getLogger("pdfminer").setLevel(logging.ERROR)
+
+# Paths and setup
+CSV_FILE = "תקנה_21.csv"
+DOWNLOAD_DIR = os.path.join(os.getcwd(), "downloads")
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-def init_db():
-    conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS filings (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            report_id TEXT UNIQUE,
-            company TEXT,
-            report_title TEXT,
-            report_date TEXT,
-            local_file TEXT,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    ''')
-    conn.commit()
-    conn.close()
-
-def extract_text_and_find_keyword(pdf_data: BytesIO) -> bool:
-    reader = PdfReader(pdf_data)
-    for page in reader.pages:
-        text = page.extract_text()
-        if text and "תקנה 21" in text:
-            return True
-    return False
 
 async def set_date(page, selector, date_str):
     await page.wait_for_selector(selector)
@@ -50,7 +39,8 @@ async def set_date(page, selector, date_str):
     """, [selector, date_str])
     logging.info(f"Set date {date_str} in {selector}")
 
-async def fetch_reports_playwright(from_year, to_year, mode="download"):
+
+async def fetch_reports_playwright(from_year, to_year, mode="extract"):
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=False)
         context = await browser.new_context(accept_downloads=True)
@@ -95,24 +85,30 @@ async def fetch_reports_playwright(from_year, to_year, mode="download"):
                 report_id = href.split("/")[-1].split("?")[0]
                 full_url = f"https://maya.tase.co.il{href}"
 
+                # locate the card to extract the company name from aria-label
+                try:
+                    card_locator = link.locator("xpath=ancestor::maya-report-card")
+                    company_name = await card_locator.locator("h3 a").get_attribute("aria-label")
+                except Exception:
+                    company_name = "לא ידוע"
+
                 await page.evaluate("url => window.open(url, '_blank')", full_url)
                 report_page = await context.wait_for_event("page")
                 await report_page.wait_for_load_state("load")
 
-                if mode == "download":
-                    await process_report_download(report_page, report_id)
-                elif mode == "extract":
-                    await process_report_extract(report_page, report_id)
+                if mode == "extract":
+                    await process_report_extract(report_page, report_id, company_name)
 
                 await report_page.close()
 
             try:
-                next_button = page.locator('div.panel-footer button:has-text("עבור לעמוד הבא")')
+                next_button = page.locator('button[aria-label="עבור לעמוד הבא"]')
                 await next_button.scroll_into_view_if_needed()
+                await page.wait_for_timeout(1000)
                 if await next_button.is_disabled():
                     logging.info("Next page button is disabled. Stopping.")
                     break
-                await next_button.click()
+                await next_button.click(force=True)
                 await page.wait_for_timeout(3000)
             except Exception as e:
                 logging.warning(f"Couldn't click next page: {e}")
@@ -120,54 +116,180 @@ async def fetch_reports_playwright(from_year, to_year, mode="download"):
 
         await browser.close()
 
-async def process_report_download(page, report_id):
+
+import re
+import csv
+import tempfile
+import fitz  # PyMuPDF
+import logging
+
+CSV_FILE = "תקנה_21.csv"
+
+def reverse_hebrew(text):
+    # הופך כל מילה עם תווים עבריים — כדי להתמודד עם כיווניות RTL במילים
+    words = text.split()
+    return ' '.join([word[::-1] if re.search(r'[\u0590-\u05FF]', word) else word for word in words])
+
+import fitz
+import tempfile
+import csv
+import re
+import logging
+
+CSV_FILE = "תקנה_21.csv"
+
+def is_table_row(words):
+    """בודק אם השורה נראית כמו שורת טבלה (מספרים/אחוזים/שדות ריקים)"""
+    numericish = lambda w: re.match(r'^[-\d,.%()]+$', w.strip())
+    count_numeric = sum(1 for w in words if numericish(w))
+    return count_numeric >= max(2, len(words) // 2)  # לפחות חצי מהשורה "נראית מספרית"
+
+async def process_report_extract(page, report_id, company):
     try:
         await page.wait_for_selector('a.ma-tooltip[aria-label="הורדת מסמך"]', timeout=15000)
-
         async with page.expect_download() as download_info:
             await page.locator('a.ma-tooltip[aria-label="הורדת מסמך"]').click()
         download = await download_info.value
 
-        local_file_path = os.path.join(DOWNLOAD_DIR, download.suggested_filename)
-        await download.save_as(local_file_path)
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp_file:
+            await download.save_as(tmp_file.name)
+            tmp_path = tmp_file.name
 
-        logging.info(f"Downloaded to {local_file_path}")
+        doc = fitz.open(tmp_path)
+        takana_page = None
+
+        for page_num in range(len(doc)):
+            page_text = doc[page_num].get_text()
+            if re.search(r"תקנה\s*21\s*[:\-]", page_text):
+                takana_page = doc.load_page(page_num)
+                break
+
+        if not takana_page:
+            logging.info(f"📄 תקנה 21 לא נמצאה עבור {company} ({report_id})")
+            return
+
+        logging.info(f"📄 מוצאת טבלה מתוך תקנה 21 עבור {company} ({report_id})")
+
+        words = takana_page.get_text("words")
+        rows_by_y = defaultdict(list)
+
+        for x0, y0, x1, y1, word, *_ in words:
+            y_key = round(y0 / 5) * 5
+            rows_by_y[y_key].append((x0, word.strip()))
+
+        structured_rows = []
+        start_found = False
+        x_threshold = 7
+
+        for y in sorted(rows_by_y.keys()):
+            row_words = sorted(rows_by_y[y], key=lambda t: t[0])
+            raw_texts = [w for _, w in row_words]
+            texts = merge_split_title_words(raw_texts)
+            if not texts:
+                continue
+
+            numericish = lambda w: re.match(r'^[-\d,.%()״"׳]+$', w)
+            num_numeric = sum(1 for w in texts if numericish(w))
+            is_table = num_numeric >= max(2, len(texts) // 2)
+
+            if not start_found:
+                if is_table:
+                    start_found = True
+                else:
+                    continue
+
+            if not is_table:
+                break
+
+            # חלוקה לשם, תפקיד ונתונים
+            name_parts = []
+            title_parts = []
+            data_parts = []
+
+            for token in reversed(texts):
+                if numericish(token) or re.match(r'^[\d]+$', token):
+                    data_parts.insert(0, token)
+                elif len(title_parts) < 2:
+                    title_parts.insert(0, token)
+                else:
+                    name_parts.insert(0, token)
+
+            full_name = " ".join(list(reversed(name_parts))).strip()
+            title = " ".join(list(reversed(title_parts))).strip()
+
+            while len(data_parts) < 14:
+                data_parts.insert(0, "")
+
+            structured_rows.append(
+                [company, title, full_name] + list(reversed(data_parts))
+            )
+
+        if not structured_rows:
+            logging.info(f"📄 לא נמצאו שורות טבלה לאחר תקנה 21 עבור {company} ({report_id})")
+            return
+
+        headers = ["חברה", "שם", "תפקיד", "היקף משרה", "שיעור החזקה בהון", "שכר",
+                   "מענק", "תגמול מבוסס מניות", "דמי ניהול", "החזר הוצאות", "עמלה",
+                   "אחר - ניהול דירקטורים", "ריבית", "דמי שכירות", "אחר", "סה\"כ (באלפי ש\"ח)"]
+
+        with open(CSV_FILE, "a", newline="", encoding="utf-8-sig") as f:
+            writer = csv.writer(f)
+            if f.tell() == 0:
+                writer.writerow(headers)
+            writer.writerows(structured_rows)
+
+        logging.info(f"✅ חולצו {len(structured_rows)} שורות תקנה 21 עבור {company} ({report_id})")
 
     except Exception as e:
-        logging.error(f"Failed to process report: {e}")
+        logging.error(f"⚠️ שגיאה ב־process_report_extract עבור {company}: {e}")
 
-async def process_report_extract(page, report_id):
-    try:
-        await page.wait_for_selector('a.ma-tooltip[aria-label="הורדת מסמך"]', timeout=15000)
 
-        async with page.expect_download() as download_info:
-            await page.locator('a.ma-tooltip[aria-label="הורדת מסמך"]').click()
-        download = await download_info.value
+def merge_split_title_words(words):
+    merged_words = []
+    i = 0
 
-        temp_path = await download.path()
-        with open(temp_path, "rb") as f:
-            pdf_data = BytesIO(f.read())
+    while i < len(words):
+        word = words[i]
 
-        found = extract_text_and_find_keyword(pdf_data)
-        if found:
-            logging.info(f"✔️ Report {report_id} contains 'תקנה 21'")
-        else:
-            logging.info(f"❌ Report {report_id} does NOT contain 'תקנה 21'")
+        # דילוג על מילים שמתחילות בסוגריים
+        if word.startswith(")"):
+            # נמשיך לדלג עד שנמצא מילה שמסתיימת בסוגריים
+            while i < len(words) and not words[i].endswith("("):
+                i += 1
+            i += 1  # נדלג גם על זו שמסתיימת
+            continue
 
-    except Exception as e:
-        logging.error(f"Failed to process report: {e}")
+        # איחוד מילים מפוצלות כמו מנכ + " + ל => מנכ"ל
+        if (
+            i + 2 < len(words)
+            and words[i + 1] == '"'
+            and re.match(r"^[\u0590-\u05FF]{2,5}$", word)  # מילים בעברית
+            and re.match(r"^[\u0590-\u05FF]$", words[i + 2])
+        ):
+            merged = f'{word}״{words[i + 2]}'
+            merged_words.append(merged)
+            i += 3
+            continue
+
+        # ניקוי גרשיים רגילים אם יש
+        word = word.replace('"', '')
+        merged_words.append(word)
+        i += 1
+
+    return merged_words
+
 
 async def main():
-    init_db()
     from_year = 2024
     to_year = 2024
-    mode = "extract"  # Change to "download" for downloading
+    mode = "extract"
 
     start_time = datetime.now()
     await fetch_reports_playwright(from_year, to_year, mode=mode)
     end_time = datetime.now()
 
     logging.info(f"All done in {end_time - start_time}")
+
 
 if __name__ == "__main__":
     asyncio.run(main())
