@@ -549,6 +549,26 @@ def detect_table_lines_in_pdf(pdf_path):
     print("\n🧾 Extracted table:")
     print(raw_df.to_string(index=False))
 
+    # Handle special case: only 1 column and many rows with full text
+    if raw_df.shape[1] == 1 and raw_df[0].str.contains(r'\d').any():
+        def parse_line(line):
+            name_match = re.search(r"^([\u0590-\u05FF\s\"\']+?)\s+(?=\d{1,3}%|\d{1,3}(,\d{3})?)", line)
+            name = name_match.group(1).strip() if name_match else "-"
+            numbers = re.findall(r"\d{1,3}(?:,\d{3})*(?:\.\d+)?%?", line)
+            values = [n.replace(",", "") for n in numbers if "%" not in n][:3]
+            services = [n.replace(",", "") for n in numbers if "%" not in n][3:-1]
+            others = [n.replace(",", "") for n in numbers if "%" not in n][-1:]
+            sum_services = sum(float(v) for v in services) if services else 0
+            sum_others = sum(float(v) for v in others) if others else 0
+            return [name, str(sum_services), str(sum_others), str(sum_services + sum_others)]
+
+        parsed = raw_df[0].apply(parse_line).tolist()
+        final_df = pd.DataFrame(parsed, columns=["שם", "תגמולים עבור שירותים", "תגמולים אחרים", "סה\"כ"])
+        final_df.insert(0, "חברה", os.path.basename(pdf_path).split("_")[0])
+        final_df.to_csv(os.path.splitext(pdf_path)[0] + "_cleaned_table.csv", index=False, encoding="utf-8-sig")
+        print("\n💾 Fallback cleaned table saved.")
+        return final_df.values.tolist()
+
     # Try to identify the header row based on keywords
     header_keywords = ["פרטי", "תגמולים", "סה"]
     max_matches = 0
@@ -582,17 +602,12 @@ def detect_table_lines_in_pdf(pdf_path):
     def is_number(s):
         return re.match(r'^-?\d+(\.\d+)?$', s.replace(",", "").strip())
 
-    # Combine תגמולים עבור שירותים
     data_df["תגמולים עבור שירותים"] = data_df[service_cols].apply(
-        lambda row: sum(float(cell.replace(",", "").replace("-", "0") or 0) for cell in row if is_number(cell)),
-        axis=1)
+        lambda row: sum(float(cell.replace(",", "").replace("-", "0") or 0) for cell in row if is_number(cell)), axis=1)
 
-    # Combine תגמולים אחרים
     data_df["תגמולים אחרים"] = data_df[other_cols].apply(
-        lambda row: sum(float(cell.replace(",", "").replace("-", "0") or 0) for cell in row if is_number(cell)),
-        axis=1)
+        lambda row: sum(float(cell.replace(",", "").replace("-", "0") or 0) for cell in row if is_number(cell)), axis=1)
 
-    # Total
     data_df["סה\"כ"] = data_df["תגמולים עבור שירותים"] + data_df["תגמולים אחרים"]
 
     required_cols = ["שם", "תפקיד", "היקף משרה", "שיעור"]
@@ -608,6 +623,10 @@ def detect_table_lines_in_pdf(pdf_path):
                 data_df[col] = ""
 
     final_df = data_df[required_cols + ["תגמולים עבור שירותים", "תגמולים אחרים", "סה\"כ"]]
+    final_df.insert(0, "חברה", os.path.basename(pdf_path).split("_")[0])
+    csv_output_path = os.path.splitext(pdf_path)[0] + "_cleaned_table.csv"
+    final_df.to_csv(csv_output_path, index=False, encoding="utf-8-sig")
+    print(f"\n💾 Cleaned table saved to: {csv_output_path}")
 
     return final_df.values.tolist()
 
