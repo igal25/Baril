@@ -497,7 +497,7 @@ import pandas as pd
 from collections import defaultdict
 
 
-def detect_table_lines_in_pdf(pdf_path):
+def detect_table_lines_in_pdf(pdf_path, csv_output_path="תקנה_21.csv"):
     doc = fitz.open(pdf_path)
     print(f"Analyzing file: {os.path.basename(pdf_path)}")
 
@@ -515,7 +515,6 @@ def detect_table_lines_in_pdf(pdf_path):
     drawings = takana_page.get_drawings()
     words = takana_page.get_text("words")
 
-    # Detect lines
     horizontal_lines = sorted({round(d['rect'].y0) for d in drawings if abs(d['rect'].y1 - d['rect'].y0) < 1})
     vertical_lines = sorted({round(d['rect'].x0) for d in drawings if abs(d['rect'].x1 - d['rect'].x0) < 1})
 
@@ -525,34 +524,24 @@ def detect_table_lines_in_pdf(pdf_path):
 
     print(f"📐 Grid size: {len(horizontal_lines) - 1} rows x {len(vertical_lines) - 1} columns")
 
-    # Build cell grid
     table = [[[] for _ in range(len(vertical_lines) - 1)] for _ in range(len(horizontal_lines) - 1)]
 
     for x0, y0, x1, y1, word, *_ in words:
         x_center = (x0 + x1) / 2
         y_center = (y0 + y1) / 2
-
-        row_idx = next((i for i in range(len(horizontal_lines) - 1)
-                        if horizontal_lines[i] <= y_center < horizontal_lines[i + 1]), None)
-        col_idx = next((j for j in range(len(vertical_lines) - 1)
-                        if vertical_lines[j] <= x_center < vertical_lines[j + 1]), None)
-
+        row_idx = next((i for i in range(len(horizontal_lines) - 1) if horizontal_lines[i] <= y_center < horizontal_lines[i + 1]), None)
+        col_idx = next((j for j in range(len(vertical_lines) - 1) if vertical_lines[j] <= x_center < vertical_lines[j + 1]), None)
         if row_idx is not None and col_idx is not None:
             table[row_idx][col_idx].append(word)
 
-    # Convert to DataFrame
-    df_rows = []
-    for row in table:
-        df_rows.append([" ".join(cell).strip() if cell else "" for cell in row])
-
+    df_rows = [[" ".join(cell).strip() if cell else "" for cell in row] for row in table]
     raw_df = pd.DataFrame(df_rows)[1:]
     print("\n🧾 Extracted table:")
     print(raw_df.to_string(index=False))
 
-    # Handle special case: only 1 column and many rows with full text
     if raw_df.shape[1] == 1 and raw_df[0].str.contains(r'\d').any():
         def parse_line(line):
-            name_match = re.search(r"^([\u0590-\u05FF\s\"\']+?)\s+(?=\d{1,3}%|\d{1,3}(,\d{3})?)", line)
+            name_match = re.search(r"^([\u0590-\u05FF\s\"']+?)\s+(?=\d{1,3}%|\d{1,3}(,\d{3})?)", line)
             name = name_match.group(1).strip() if name_match else "-"
             numbers = re.findall(r"\d{1,3}(?:,\d{3})*(?:\.\d+)?%?", line)
             values = [n.replace(",", "") for n in numbers if "%" not in n][:3]
@@ -565,69 +554,66 @@ def detect_table_lines_in_pdf(pdf_path):
         parsed = raw_df[0].apply(parse_line).tolist()
         final_df = pd.DataFrame(parsed, columns=["שם", "תגמולים עבור שירותים", "תגמולים אחרים", "סה\"כ"])
         final_df.insert(0, "חברה", os.path.basename(pdf_path).split("_")[0])
-        final_df.to_csv(os.path.splitext(pdf_path)[0] + "_cleaned_table.csv", index=False, encoding="utf-8-sig")
-        print("\n💾 Fallback cleaned table saved.")
-        return final_df.values.tolist()
+    else:
+        header_keywords = ["פרטי", "תגמולים", "סה"]
+        max_matches = 0
+        header_row_idx = None
+        for i, row in raw_df.iterrows():
+            match_count = sum(1 for cell in row if any(kw in str(cell) for kw in header_keywords))
+            if match_count > max_matches:
+                max_matches = match_count
+                header_row_idx = i
 
-    # Try to identify the header row based on keywords
-    header_keywords = ["פרטי", "תגמולים", "סה"]
-    max_matches = 0
-    header_row_idx = None
-    for i, row in raw_df.iterrows():
-        match_count = sum(1 for cell in row if any(kw in str(cell) for kw in header_keywords))
-        if match_count > max_matches:
-            max_matches = match_count
-            header_row_idx = i
+        if header_row_idx is None:
+            print("⚠️ לא נמצאה שורת כותרת.")
+            return
 
-    if header_row_idx is None:
-        print("⚠️ לא נמצאה שורת כותרת.")
-        return
+        header_row = raw_df.iloc[header_row_idx]
+        data_df = raw_df.iloc[header_row_idx + 1:].reset_index(drop=True)
+        data_df.columns = header_row[:data_df.shape[1]].tolist()
+        print("📌 Columns detected:", list(data_df.columns))
 
-    header_row = raw_df.iloc[header_row_idx]
-    data_df = raw_df.iloc[header_row_idx + 1:].reset_index(drop=True)
-    data_df.columns = header_row[:data_df.shape[1]].tolist()
-    print("📌 Columns detected:", list(data_df.columns))
+        def find_columns_by_keywords(columns, keywords, exact=False):
+            if exact:
+                return [col for col in columns if col.strip() in keywords]
+            else:
+                return [col for col in columns if any(kw in col for kw in keywords)]
 
-    def find_columns_by_keywords(columns, keywords, exact=False):
-        if exact:
-            return [col for col in columns if col.strip() in keywords]
-        else:
-            return [col for col in columns if any(kw in col for kw in keywords)]
+        service_cols = find_columns_by_keywords(data_df.columns, ["שכר", "מענק", "מניות", "ניהול", "ייעוץ", "עמלה", "רכב"])
+        other_cols = find_columns_by_keywords(data_df.columns, ["ריבית", "שכירות"])
+        other_cols.extend(find_columns_by_keywords(data_df.columns, ["אחר"], exact=True))
 
-    service_cols = find_columns_by_keywords(data_df.columns,
-                                            ["שכר", "מענק", "מניות", "ניהול", "ייעוץ", "עמלה", "רכב"])
-    other_cols = find_columns_by_keywords(data_df.columns, ["ריבית", "שכירות"])
-    other_cols.extend(find_columns_by_keywords(data_df.columns, ["אחר"], exact=True))
+        def is_number(s):
+            return re.match(r'^-?\d+(\.\d+)?$', s.replace(",", "").strip())
 
-    def is_number(s):
-        return re.match(r'^-?\d+(\.\d+)?$', s.replace(",", "").strip())
+        data_df["תגמולים עבור שירותים"] = data_df[service_cols].apply(
+            lambda row: sum(float(cell.replace(",", "").replace("-", "0") or 0) for cell in row if is_number(cell)), axis=1)
 
-    data_df["תגמולים עבור שירותים"] = data_df[service_cols].apply(
-        lambda row: sum(float(cell.replace(",", "").replace("-", "0") or 0) for cell in row if is_number(cell)), axis=1)
+        data_df["תגמולים אחרים"] = data_df[other_cols].apply(
+            lambda row: sum(float(cell.replace(",", "").replace("-", "0") or 0) for cell in row if is_number(cell)), axis=1)
 
-    data_df["תגמולים אחרים"] = data_df[other_cols].apply(
-        lambda row: sum(float(cell.replace(",", "").replace("-", "0") or 0) for cell in row if is_number(cell)), axis=1)
+        data_df["סה\"כ"] = data_df["תגמולים עבור שירותים"] + data_df["תגמולים אחרים"]
 
-    data_df["סה\"כ"] = data_df["תגמולים עבור שירותים"] + data_df["תגמולים אחרים"]
+        required_cols = ["שם", "תפקיד", "היקף משרה", "שיעור"]
+        for col in required_cols:
+            if col not in data_df.columns:
+                found = False
+                for existing_col in data_df.columns:
+                    if col in existing_col:
+                        data_df[col] = data_df[existing_col]
+                        found = True
+                        break
+                if not found:
+                    data_df[col] = ""
 
-    required_cols = ["שם", "תפקיד", "היקף משרה", "שיעור"]
-    for col in required_cols:
-        if col not in data_df.columns:
-            found = False
-            for existing_col in data_df.columns:
-                if col in existing_col:
-                    data_df[col] = data_df[existing_col]
-                    found = True
-                    break
-            if not found:
-                data_df[col] = ""
+        final_df = data_df[required_cols + ["תגמולים עבור שירותים", "תגמולים אחרים", "סה\"כ"]]
+        final_df.insert(0, "חברה", os.path.basename(pdf_path).split("_")[0])
 
-    final_df = data_df[required_cols + ["תגמולים עבור שירותים", "תגמולים אחרים", "סה\"כ"]]
-    final_df.insert(0, "חברה", os.path.basename(pdf_path).split("_")[0])
-    csv_output_path = os.path.splitext(pdf_path)[0] + "_cleaned_table.csv"
-    final_df.to_csv(csv_output_path, index=False, encoding="utf-8-sig")
-    print(f"\n💾 Cleaned table saved to: {csv_output_path}")
+    with open(csv_output_path, "a", newline="", encoding="utf-8-sig") as f:
+        header = not os.path.exists(csv_output_path) or os.path.getsize(csv_output_path) == 0
+        final_df.to_csv(f, index=False, header=header)
 
+    print(f"\n💾 Cleaned table appended to: {csv_output_path}")
     return final_df.values.tolist()
 
 
