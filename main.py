@@ -2,17 +2,14 @@ import asyncio
 import os
 import logging
 import tempfile
-import re
 import csv
-from collections import defaultdict
 from datetime import datetime
-from io import BytesIO
 from typing import List
-
-import fitz  # PyMuPDF
 from playwright.async_api import async_playwright
-from pdfminer.high_level import extract_text
-from pdfminer.layout import LAParams
+import fitz
+import os
+import re
+import pandas as pd
 
 # Suppress PyMuPDF and pdfminer warnings
 logging.getLogger("fitz").setLevel(logging.ERROR)
@@ -146,7 +143,7 @@ async def fetch_reports_playwright(from_year, to_year, mode="extract"):
                 await report_page.wait_for_load_state("load")
 
                 if mode == "extract":
-                    await process_report_extract(report_page, report_id, company_name)
+                    await process_report_extract(report_page, report_id, company_name, from_year)
                 await report_page.close()
 
             try:
@@ -164,7 +161,8 @@ async def fetch_reports_playwright(from_year, to_year, mode="extract"):
 
         await browser.close()
 
-async def process_report_extract2(page, report_id, company):
+
+async def process_report_extract(page, report_id, company, year):
     try:
         await page.wait_for_selector('a.ma-tooltip[aria-label="הורדת מסמך"]', timeout=15000)
         async with page.expect_download() as download_info:
@@ -175,329 +173,22 @@ async def process_report_extract2(page, report_id, company):
             await download.save_as(tmp_file.name)
             tmp_path = tmp_file.name
 
-        doc = fitz.open(tmp_path)
-        takana_page = None
-
-        for page_num in range(len(doc)):
-            page_text = doc[page_num].get_text()
-            if re.search(r"תקנה\s*21\s*[:\-]", page_text):
-                takana_page = doc.load_page(page_num)
-                break
-
-        if not takana_page:
-            logging.info(f"📄 תקנה 21 לא נמצאה עבור {company} ({report_id})")
-            return
-
-        words = takana_page.get_text("words")
-        rows_by_y = defaultdict(list)
-
-        for x0, y0, x1, y1, word, *_ in words:
-            if not word.strip():
-                continue
-            y_key = round(y0 / 5) * 5
-            rows_by_y[y_key].append((x0, y0, word.strip()))
-
-        header_line = None
-        header_keywords = [
-            "שם", "תפקיד", "היקף", "החזקה", "שכר", "מענק", "מניות", "ניהול",
-            "ייעוץ", "עמלה", "אחר", "רכב", "ריבית", "שכירות", "סה"
-        ]
-        column_bounds = []
-        header_y = None
-
-        for y in sorted(rows_by_y.keys()):
-            row = rows_by_y[y]
-            text_row = [w for _, _, w in row]
-            if sum(1 for h in header_keywords if any(h in w for w in text_row)) >= 3:
-                header_line = row
-                header_y = y
-                break
-
-        if not header_line:
-            logging.warning(f"לא נמצאה שורת הכותרות עבור {company}")
-            return
-
-        for x, _, word in sorted(header_line, key=lambda t: t[0]):
-            cleaned = word.strip().replace('\n', '')
-            column_bounds.append((cleaned, x))
-
-        columns = []
-        for i in range(len(column_bounds)):
-            col_name, x0 = column_bounds[i]
-            x1 = column_bounds[i + 1][1] if i + 1 < len(column_bounds) else x0 + 100
-            columns.append((col_name, x0, x1))
-
-        def assign_column(x):
-            for name, start, end in columns:
-                if start <= x < end:
-                    return name
-            return None
-
-        structured_rows = []
-        blank_count = 0
-        start_found = False
-
-        for y in sorted(rows_by_y.keys()):
-            if rows_by_y[y] == header_line:
-                start_found = True
-                continue
-            if not start_found or y <= header_y:
-                continue
-
-            row_words = sorted(rows_by_y[y], key=lambda t: t[0])
-            if len(row_words) < 2:
-                blank_count += 1
-                if blank_count >= 5:
-                    break  # יצאנו מהטבלה - יותר מדי שורות ריקות ברצף
-                continue
-            blank_count = 0
-
-            row_data = defaultdict(list)
-            for x, y_val, word in row_words:
-                col = assign_column(x)
-                if col:
-                    row_data[col].append(word)
-
-            clean_text = lambda t: re.sub(r'\([^)]*\)', '', t).replace('=', '').strip()
-            get_val = lambda key: clean_text(" ".join(row_data[key])) if key in row_data else "-"
-
-            full_name = get_val("שם")
-            title = get_val("תפקיד")
-            profile1 = get_val("היקף משרה")
-            profile2 = get_val("שיעור החזקה בהון") if "שיעור החזקה בהון" in row_data else get_val("שיעור החזקה")
-            profile3 = get_val("שיעור החזקה בהצבעה") if "שיעור החזקה בהצבעה" in row_data else "-"
-
-            if full_name == "-" and title == "-":
-                continue
-
-            percent_pattern = re.compile(r"(\d{1,3}(\.\d+)?%)")
-            title_words = row_data.get("תפקיד", [])
-            name_words = row_data.get("שם", [])
-            for word in title_words + name_words:
-                matches = percent_pattern.findall(word)
-                for match in matches:
-                    value = match[0].replace('%', '')
-                    try:
-                        val = float(value)
-                        if val <= 100:
-                            if profile2 == "-":
-                                profile2 = f"{val}%"
-                            elif profile3 == "-":
-                                profile3 = f"{val}%"
-                    except:
-                        continue
-
-            service_keywords = ["שכר", "מענק", "מניות", "ניהול", "ייעוץ", "עמלה", "אחר", "רכב"]
-            other_keywords = ["ריבית", "שכירות", "אחר"]
-
-            def sum_vals_by_keywords(keywords):
-                total = 0
-                for k in row_data:
-                    if any(kw in k for kw in keywords):
-                        for val in row_data[k]:
-                            val = val.replace(",", "").replace("(", "").replace(")", "")
-                            if val == "-" or not val:
-                                continue
-                            try:
-                                total += float(val)
-                            except:
-                                continue
-                return str(int(total)) if total else "-"
-
-            tagmul_services = sum_vals_by_keywords(service_keywords)
-            tagmul_others = sum_vals_by_keywords(other_keywords)
-            try:
-                total_combined = str(int(tagmul_services) + int(tagmul_others))
-            except:
-                total_combined = "-"
-
-            row = [
-                company,
-                full_name,
-                title,
-                profile1,
-                profile2,
-                profile3,
-                tagmul_services,
-                tagmul_others,
-                total_combined
-            ]
-            structured_rows.append(row)
-
-        if not structured_rows:
-            logging.info(f"📄 לא נמצאו שורות טבלה לאחר תקנה 21 עבור {company} ({report_id})")
-            return
-
-        headers = [
-            "חברה", "שם", "תפקיד", "היקף משרה", "שיעור החזקה בהון",
-            "שיעור החזקה בהצבעה", "תגמולים (שירותים)", "תגמולים אחרים", "סה\"כ (בש\"ח)"
-        ]
-
-        with open(CSV_FILE, "a", newline="", encoding="utf-8-sig") as f:
-            writer = csv.writer(f)
-            if f.tell() == 0:
-                writer.writerow(headers)
-            writer.writerows(structured_rows)
-
-        logging.info(f"✅ חולצו {len(structured_rows)} שורות תקנה 21 עבור {company} ({report_id})")
-
-    except Exception as e:
-        logging.error(f"⚠️ שגיאה ב־process_report_extract עבור {company}: {e}")
-
-
-async def process_report_extract(page, report_id, company):
-    try:
-        await page.wait_for_selector('a.ma-tooltip[aria-label="הורדת מסמך"]', timeout=15000)
-        async with page.expect_download() as download_info:
-            await page.locator('a.ma-tooltip[aria-label="הורדת מסמך"]').click()
-        download = await download_info.value
-
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp_file:
-            await download.save_as(tmp_file.name)
-            tmp_path = tmp_file.name
-
-        doc = fitz.open(tmp_path)
-        takana_page = None
-
-        rows = detect_table_lines_in_pdf(tmp_path, company)
+        rows = detect_table_lines_in_pdf(tmp_path)
 
         headers = ["שם מלא", "תפקיד", "היקף משרה", "שיעור החזקה", "תגמולים עבור שירותים", "תגמולים אחרים", "סה\"כ"]
 
         with open(CSV_FILE, "a", newline="", encoding="utf-8-sig") as f:
             writer = csv.writer(f)
             if f.tell() == 0:
-                writer.writerow(["חברה"] + headers)
+                writer.writerow(["שנה", "חברה"] + headers)
             for row in rows:
-                writer.writerow([company] + row)
+                writer.writerow([year, company] + row)
 
-        """for page_num in range(len(doc)):
-            page_text = doc[page_num].get_text()
-            if re.search(r"תקנה\s*21\s*[:\-]", page_text):
-                takana_page = doc.load_page(page_num)
-                break
-
-        if not takana_page:
-            logging.info(f"📄 תקנה 21 לא נמצאה עבור {company} ({report_id})")
-            return
-
-        words = takana_page.get_text("words")
-
-        expected_headers = [
-            ("פרטי מקבלי התגמולים", ["פרטי", "מקבלי", "התגמולים"]),
-            ("תגמולים עבור שירותים", ["תגמולים", "עבור", "שירותים"]),
-            ("תגמולים אחרים", ["תגמולים", "אחרים"]),
-            ("סה", ["סה"])
-        ]
-
-        header_matches = {}
-        rows_by_y = defaultdict(list)
-        for x0, y0, x1, y1, word, *_ in words:
-            if not word.strip():
-                continue
-            y_key = round(y0 / 5) * 5
-            rows_by_y[y_key].append((x0, x1, word.strip()))
-
-        for y, row in rows_by_y.items():
-            words_in_row = [w for _, _, w in row]
-            for header_name, parts in expected_headers:
-                if header_name in header_matches:
-                    continue
-                if all(part in words_in_row for part in parts):
-                    xs = [x0 for x0, _, w in row if w in parts]
-                    xe = [x1 for _, x1, w in row if w in parts]
-                    if xs and xe:
-                        header_matches[header_name] = (min(xs), max(xe))
-
-        if len(header_matches) < 4:
-            logging.warning(f"❌ לא נמצאו כל ארבעת בלוקי העמודות עבור {company}")
-            return
-
-        sorted_headers = sorted(header_matches.items(), key=lambda t: t[1][0])
-        blocks = []
-        for i in range(len(sorted_headers)):
-            name, (x0, _) = sorted_headers[i]
-            x1 = sorted_headers[i + 1][1][0] if i + 1 < len(sorted_headers) else x0 + 200
-            blocks.append((name, x0, x1))
-
-        def assign_block(x):
-            for name, start, end in blocks:
-                if start <= x < end:
-                    return name
-            return "unknown"
-
-        table_data = defaultdict(lambda: defaultdict(list))
-        for x0, y0, x1, y1, word, *_ in words:
-            if not word.strip():
-                continue
-            y_key = round(y0 / 5) * 5
-            block = assign_block(x0)
-            table_data[y_key][block].append((x0, word.strip()))
-
-        def sum_numeric_values(word_list):
-            total = 0
-            for _, word in word_list:
-                word_clean = word.replace(",", "").replace("-", "0").strip()
-                try:
-                    total += float(word_clean)
-                except:
-                    continue
-            return int(total) if total else "-"
-
-        structured_rows = []
-        header_y = max(y for y in rows_by_y if any("פרטי" in w for _, _, w in rows_by_y[y]))
-        y_sorted = sorted([y for y in table_data.keys() if y > header_y + 10])
-
-        previous_y = None
-        star_counter = 0
-        for y in y_sorted:
-            row_words = [w for block in table_data[y].values() for _, w in block]
-            if any(word.startswith("(*)") for word in row_words):
-                star_counter += 1
-                if star_counter == 2:
-                    break
-
-            row = table_data[y]
-            block1_words = sorted(row.get("פרטי מקבלי התגמולים", []), key=lambda t: t[0])
-            full_name = " ".join(word for _, word in block1_words).strip() or "-"
-
-            tagmul_services = sum_numeric_values(row.get("תגמולים עבור שירותים", []))
-            tagmul_others = sum_numeric_values(row.get("תגמולים אחרים", []))
-
-            try:
-                total = tagmul_services + tagmul_others if tagmul_services != "-" and tagmul_others != "-" else "-"
-            except:
-                total = "-"
-
-            structured_rows.append([
-                company,
-                full_name,
-                tagmul_services,
-                tagmul_others,
-                total
-            ])
-
-        headers = ["חברה", "פרטי מקבל", "תגמולים בעבור שירותים", "תגמולים אחרים", "סה\"כ"]
-
-        with open(CSV_FILE, "a", newline="", encoding="utf-8-sig") as f:
-            writer = csv.writer(f)
-            if f.tell() == 0:
-                writer.writerow(headers)
-            writer.writerows(structured_rows)
-
-        logging.info(f"✅ טבלה חולצה לפי בלוקים ונותחה בהצלחה עבור {company} ({report_id})")
-"""
     except Exception as e:
         logging.error(f"⚠️ שגיאה ב־process_report_extract עבור {company}: {e}")
 
 
-import fitz  # PyMuPDF
-import os
-import re
-import pandas as pd
-from collections import defaultdict
-
-
-def detect_table_lines_in_pdf(pdf_path, company_name, csv_output_path="תקנה_21.csv"):
+def detect_table_lines_in_pdf(pdf_path):
     doc = fitz.open(pdf_path)
     print(f"Analyzing file: {os.path.basename(pdf_path)}")
 
@@ -608,16 +299,6 @@ def detect_table_lines_in_pdf(pdf_path, company_name, csv_output_path="תקנה_
         final_df = data_df[required_cols + ["תגמולים עבור שירותים", "תגמולים אחרים", "סה\"כ"]]
         final_df = final_df[final_df["שם"].astype(str).str.strip() != ""]
         return final_df.values.tolist()
-
-'''
-    if os.path.exists(csv_output_path):
-        existing_df = pd.read_csv(csv_output_path, encoding="utf-8-sig")
-        combined_df = pd.concat([existing_df, final_df], ignore_index=True)
-        combined_df.drop_duplicates(inplace=True)
-        combined_df.to_csv(csv_output_path, index=False, encoding="utf-8-sig")
-    else:
-        final_df.to_csv(csv_output_path, index=False, encoding="utf-8-sig")
-'''
 
 
 async def main():
