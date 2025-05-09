@@ -359,7 +359,7 @@ async def process_report_extract(page, report_id, company):
         doc = fitz.open(tmp_path)
         takana_page = None
 
-        rows = detect_table_lines_in_pdf(tmp_path)
+        rows = detect_table_lines_in_pdf(tmp_path, company)
 
         headers = ["שם מלא", "תפקיד", "היקף משרה", "שיעור החזקה", "תגמולים עבור שירותים", "תגמולים אחרים", "סה\"כ"]
 
@@ -497,7 +497,7 @@ import pandas as pd
 from collections import defaultdict
 
 
-def detect_table_lines_in_pdf(pdf_path, csv_output_path="תקנה_21.csv"):
+def detect_table_lines_in_pdf(pdf_path, company_name, csv_output_path="תקנה_21.csv"):
     doc = fitz.open(pdf_path)
     print(f"Analyzing file: {os.path.basename(pdf_path)}")
 
@@ -553,7 +553,6 @@ def detect_table_lines_in_pdf(pdf_path, csv_output_path="תקנה_21.csv"):
 
         parsed = raw_df[0].apply(parse_line).tolist()
         final_df = pd.DataFrame(parsed, columns=["שם", "תגמולים עבור שירותים", "תגמולים אחרים", "סה\"כ"])
-        final_df.insert(0, "חברה", os.path.basename(pdf_path).split("_")[0])
     else:
         header_keywords = ["פרטי", "תגמולים", "סה"]
         max_matches = 0
@@ -607,14 +606,18 @@ def detect_table_lines_in_pdf(pdf_path, csv_output_path="תקנה_21.csv"):
                     data_df[col] = ""
 
         final_df = data_df[required_cols + ["תגמולים עבור שירותים", "תגמולים אחרים", "סה\"כ"]]
-        final_df.insert(0, "חברה", os.path.basename(pdf_path).split("_")[0])
+        final_df = final_df[final_df["שם"].astype(str).str.strip() != ""]
+        return final_df.values.tolist()
 
-    with open(csv_output_path, "a", newline="", encoding="utf-8-sig") as f:
-        header = not os.path.exists(csv_output_path) or os.path.getsize(csv_output_path) == 0
-        final_df.to_csv(f, index=False, header=header)
-
-    print(f"\n💾 Cleaned table appended to: {csv_output_path}")
-    return final_df.values.tolist()
+'''
+    if os.path.exists(csv_output_path):
+        existing_df = pd.read_csv(csv_output_path, encoding="utf-8-sig")
+        combined_df = pd.concat([existing_df, final_df], ignore_index=True)
+        combined_df.drop_duplicates(inplace=True)
+        combined_df.to_csv(csv_output_path, index=False, encoding="utf-8-sig")
+    else:
+        final_df.to_csv(csv_output_path, index=False, encoding="utf-8-sig")
+'''
 
 
 async def main():
